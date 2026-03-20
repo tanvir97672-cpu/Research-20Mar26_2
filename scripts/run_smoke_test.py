@@ -26,6 +26,7 @@ class LocalItem:
 
     sample_id: str
     local_path: Path
+    class_index: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,22 +43,29 @@ class SmokeConfig:
     max_train_steps: int
     device: str
     profile: str
+    report_json: Path | None
     dry_run: bool
 
 
-class DeterministicMapper(nn.Module):
-    """Tiny linear mapper with non-random deterministic parameter initialization."""
+class DeterministicSmokeModel(nn.Module):
+    """Tiny deterministic model with reconstruction and classification heads."""
 
-    def __init__(self, feature_dim: int) -> None:
+    def __init__(self, feature_dim: int, num_classes: int) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.eye(feature_dim, dtype=torch.float32), requires_grad=True)
-        self.bias = nn.Parameter(torch.zeros(feature_dim, dtype=torch.float32), requires_grad=True)
+        if num_classes <= 0:
+            raise ValueError("num_classes must be > 0")
+        self.recon_weight = nn.Parameter(torch.eye(feature_dim, dtype=torch.float32), requires_grad=True)
+        self.recon_bias = nn.Parameter(torch.zeros(feature_dim, dtype=torch.float32), requires_grad=True)
+        self.cls_weight = nn.Parameter(torch.zeros(num_classes, feature_dim, dtype=torch.float32), requires_grad=True)
+        self.cls_bias = nn.Parameter(torch.zeros(num_classes, dtype=torch.float32), requires_grad=True)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return x @ self.weight.T + self.bias
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        recon = x @ self.recon_weight.T + self.recon_bias
+        logits = x @ self.cls_weight.T + self.cls_bias
+        return recon, logits
 
 
-def _load_subset_manifest(path: Path) -> list[LocalItem]:
+def _load_subset_manifest(path: Path) -> tuple[list[LocalItem], list[str]]:
     if not path.exists():
         raise RuntimeError(f"subset manifest does not exist: {path}")
 
@@ -83,7 +91,7 @@ def _load_subset_manifest(path: Path) -> list[LocalItem]:
     if len(items_list) == 0:
         raise RuntimeError("subset manifest contains no items")
 
-    items: list[LocalItem] = []
+    raw_items: list[tuple[str, Path]] = []
     for idx, raw in enumerate(items_list, start=1):
         if not isinstance(raw, dict):
             raise RuntimeError(f"subset manifest item {idx} is malformed")
@@ -100,9 +108,22 @@ def _load_subset_manifest(path: Path) -> list[LocalItem]:
         if not file_path.exists():
             raise RuntimeError(f"subset data file does not exist: {file_path}")
 
-        items.append(LocalItem(sample_id=sample_id, local_path=file_path))
+        raw_items.append((sample_id, file_path))
 
-    return items
+    class_names = sorted({sample_id for sample_id, _ in raw_items})
+    class_to_index = {name: idx for idx, name in enumerate(class_names)}
+
+    items: list[LocalItem] = []
+    for sample_id, file_path in raw_items:
+        items.append(
+            LocalItem(
+                sample_id=sample_id,
+                local_path=file_path,
+                class_index=class_to_index[sample_id],
+            )
+        )
+
+    return items, class_names
 
 
 def _bytes_to_pair(raw: bytes, feature_dim: int) -> tuple[Tensor, Tensor] | None:
@@ -118,7 +139,7 @@ def _bytes_to_pair(raw: bytes, feature_dim: int) -> tuple[Tensor, Tensor] | None
     return x, y
 
 
-def _iter_real_pairs(items: list[LocalItem], cfg: SmokeConfig) -> Iterator[tuple[Tensor, Tensor]]:
+def _iter_real_pairs(items: list[LocalItem], cfg: SmokeConfig) -> Iterator[tuple[Tensor, Tensor, int]]:
     yielded = 0
     for item in items[: cfg.max_files]:
         if yielded >= cfg.max_files:
@@ -140,7 +161,8 @@ def _iter_real_pairs(items: list[LocalItem], cfg: SmokeConfig) -> Iterator[tuple
                         continue
                     inner_count += 1
                     yielded += 1
-                    yield pair
+                    x, y = pair
+                    yield x, y, item.class_index
                     if yielded >= cfg.max_files:
                         break
         else:
@@ -149,26 +171,96 @@ def _iter_real_pairs(items: list[LocalItem], cfg: SmokeConfig) -> Iterator[tuple
             if pair is None:
                 continue
             yielded += 1
-            yield pair
+            x, y = pair
+            yield x, y, item.class_index
 
 
-def _iter_real_batches(items: list[LocalItem], cfg: SmokeConfig) -> Iterator[tuple[Tensor, Tensor]]:
+def _iter_real_batches(items: list[LocalItem], cfg: SmokeConfig) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
     x_buf: list[Tensor] = []
     y_buf: list[Tensor] = []
-    for x, y in _iter_real_pairs(items, cfg):
+    t_buf: list[int] = []
+    for x, y, label in _iter_real_pairs(items, cfg):
         x_buf.append(x)
         y_buf.append(y)
+        t_buf.append(label)
         if len(x_buf) >= cfg.batch_size:
             x_batch = torch.stack(x_buf, dim=0)
             y_batch = torch.stack(y_buf, dim=0)
-            yield x_batch, y_batch
+            t_batch = torch.tensor(t_buf, dtype=torch.long)
+            yield x_batch, y_batch, t_batch
             x_buf.clear()
             y_buf.clear()
+            t_buf.clear()
 
     if len(x_buf) > 0:
         x_batch = torch.stack(x_buf, dim=0)
         y_batch = torch.stack(y_buf, dim=0)
-        yield x_batch, y_batch
+        t_batch = torch.tensor(t_buf, dtype=torch.long)
+        yield x_batch, y_batch, t_batch
+
+
+def _compute_classification_metrics(
+    y_true: list[int],
+    y_pred: list[int],
+    num_classes: int,
+) -> dict[str, Any]:
+    if num_classes <= 0:
+        raise ValueError("num_classes must be > 0")
+    if len(y_true) != len(y_pred):
+        raise ValueError("y_true and y_pred lengths must match")
+
+    matrix: list[list[int]] = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
+    for truth, pred in zip(y_true, y_pred):
+        if not (0 <= truth < num_classes) or not (0 <= pred < num_classes):
+            raise ValueError("class index out of bounds")
+        matrix[truth][pred] += 1
+
+    total = len(y_true)
+    correct = sum(matrix[i][i] for i in range(num_classes))
+    accuracy = (correct / total) if total > 0 else 0.0
+
+    per_class: list[dict[str, Any]] = []
+    precision_macro_sum = 0.0
+    recall_macro_sum = 0.0
+    f1_macro_sum = 0.0
+
+    for cls in range(num_classes):
+        tp = matrix[cls][cls]
+        fp = sum(matrix[row][cls] for row in range(num_classes) if row != cls)
+        fn = sum(matrix[cls][col] for col in range(num_classes) if col != cls)
+        support = tp + fn
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        precision_macro_sum += precision
+        recall_macro_sum += recall
+        f1_macro_sum += f1
+
+        per_class.append(
+            {
+                "class_index": cls,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "support": support,
+            }
+        )
+
+    denom = float(num_classes)
+    precision_macro = precision_macro_sum / denom
+    recall_macro = recall_macro_sum / denom
+    f1_macro = f1_macro_sum / denom
+
+    return {
+        "accuracy": accuracy,
+        "precision_macro": precision_macro,
+        "recall_macro": recall_macro,
+        "f1_macro": f1_macro,
+        "confusion_matrix": matrix,
+        "per_class": per_class,
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -207,6 +299,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Use minimal safe limits for potato-laptop mechanics testing",
+    )
+    parser.add_argument(
+        "--report-json",
+        type=Path,
+        default=None,
+        help="Optional path to write a structured JSON report with all metrics",
     )
     return parser
 
@@ -264,18 +362,20 @@ def main() -> int:
         max_train_steps=resolved_steps,
         device=args.device,
         profile=args.profile,
+        report_json=args.report_json,
         dry_run=args.dry_run,
     )
 
     try:
-        items = _load_subset_manifest(cfg.subset_manifest_path)
+        items, class_names = _load_subset_manifest(cfg.subset_manifest_path)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    model = DeterministicMapper(cfg.feature_dim).to(cfg.device)
+    model = DeterministicSmokeModel(cfg.feature_dim, len(class_names)).to(cfg.device)
     optimizer: torch.optim.Optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-    criterion = nn.MSELoss(reduction="mean")
+    recon_criterion = nn.MSELoss(reduction="mean")
+    cls_criterion = nn.CrossEntropyLoss(reduction="mean")
     use_amp = cfg.device == "cuda"
     scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
 
@@ -286,25 +386,38 @@ def main() -> int:
     total_steps = 0
     total_samples = 0
     last_loss = 0.0
+    last_recon_loss = 0.0
+    last_cls_loss = 0.0
     start_time = time.perf_counter()
+    y_true: list[int] = []
+    y_pred: list[int] = []
 
     model.train()
     for _ in range(cfg.epochs):
-        for x_cpu, y_cpu in _iter_real_batches(items, cfg):
+        for x_cpu, y_cpu, t_cpu in _iter_real_batches(items, cfg):
             x = x_cpu.to(cfg.device, non_blocking=use_amp)
             y = y_cpu.to(cfg.device, non_blocking=use_amp)
+            t = t_cpu.to(cfg.device, non_blocking=use_amp)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                out = model(x)
-                loss = criterion(out, y)
+                recon, logits = model(x)
+                recon_loss = recon_criterion(recon, y)
+                cls_loss = cls_criterion(logits, t)
+                loss = recon_loss + cls_loss
             scaler.scale(loss).backward()
             scaler.step(cast(Any, optimizer))
             scaler.update()
 
+            pred = torch.argmax(logits.detach(), dim=1)
+            y_true.extend(t.detach().cpu().tolist())
+            y_pred.extend(pred.cpu().tolist())
+
             total_steps += 1
             total_samples += int(x.shape[0])
             last_loss = float(loss.detach().cpu().item())
+            last_recon_loss = float(recon_loss.detach().cpu().item())
+            last_cls_loss = float(cls_loss.detach().cpu().item())
 
             if total_steps >= cfg.max_train_steps:
                 break
@@ -317,6 +430,7 @@ def main() -> int:
 
     elapsed = time.perf_counter() - start_time
     samples_per_sec = total_samples / elapsed if elapsed > 0 else 0.0
+    metrics = _compute_classification_metrics(y_true, y_pred, len(class_names))
 
     print("Smoke test completed")
     print(f"Device: {cfg.device}")
@@ -328,6 +442,36 @@ def main() -> int:
     print(f"Elapsed sec: {elapsed:.6f}")
     print(f"Samples/sec: {samples_per_sec:.6f}")
     print(f"Last loss: {last_loss:.8f}")
+    print(f"Last recon loss: {last_recon_loss:.8f}")
+    print(f"Last cls loss: {last_cls_loss:.8f}")
+    print(f"Accuracy: {metrics['accuracy']:.8f}")
+    print(f"Precision macro: {metrics['precision_macro']:.8f}")
+    print(f"Recall macro: {metrics['recall_macro']:.8f}")
+    print(f"F1 macro: {metrics['f1_macro']:.8f}")
+
+    if cfg.report_json is not None:
+        report_payload: dict[str, Any] = {
+            "device": cfg.device,
+            "profile": cfg.profile,
+            "dry_run": cfg.dry_run,
+            "batch_size": cfg.batch_size,
+            "steps": total_steps,
+            "samples": total_samples,
+            "elapsed_sec": elapsed,
+            "samples_per_sec": samples_per_sec,
+            "last_loss": last_loss,
+            "last_recon_loss": last_recon_loss,
+            "last_cls_loss": last_cls_loss,
+            "class_names": class_names,
+            "classification": metrics,
+        }
+        try:
+            cfg.report_json.parent.mkdir(parents=True, exist_ok=True)
+            cfg.report_json.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: failed writing report json: {exc}", file=sys.stderr)
+            return 2
+
     return 0
 
 
