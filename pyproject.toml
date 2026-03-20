@@ -72,7 +72,7 @@ pretty = true
 namespace_packages = true
 explicit_package_bases = true
 mypy_path = ["src"]
-exclude = ["^\.venv/"]
+exclude = ['^\.venv/']
 
 [tool.pytest.ini_options]
 minversion = "8.0"
