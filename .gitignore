@@ -29,7 +29,7 @@ htmlcov/
 Thumbs.db
 
 # Data and checkpoints (real experiment outputs)
-data/
-artifacts/
-checkpoints/
-logs/
+/data/
+/artifacts/
+/checkpoints/
+/logs/
