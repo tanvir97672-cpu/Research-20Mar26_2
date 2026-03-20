@@ -1,0 +1,22 @@
+{
+    "project_name": "rffi-open-set",
+    "debug": false,
+    "data": {
+        "project_root": ".",
+        "metadata_dir": "metadata",
+        "raw_data_dir": "data/raw",
+        "artifacts_dir": "artifacts"
+    },
+    "runtime": {
+        "num_workers": 0,
+        "prefetch_factor": 2,
+        "pin_memory": false,
+        "local_batch_upper_bound": 16,
+        "cloud_batch_upper_bound": 64
+    },
+    "lightning": {
+        "accelerator": "gpu",
+        "gpu_type": "L4",
+        "mixed_precision": "16-mixed"
+    }
+}

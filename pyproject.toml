@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling>=1.26.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rffi-open-set"
+version = "0.1.0"
+description = "Foundational, type-safe codebase for real-data open-set RFFI research."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Research Team" }
+]
+dependencies = [
+  "typing-extensions>=4.12,<5.0"
+]
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.3,<2.7"
+]
+dev = [
+  "mypy>=1.14,<1.16",
+  "pyright>=1.1.390,<1.2",
+  "ruff>=0.8.0,<0.10",
+  "pytest>=8.3,<9.0",
+  "pytest-cov>=6.0,<7.0"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rffi_core"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "W",
+  "I",
+  "B",
+  "UP",
+  "N",
+  "ANN",
+  "RUF",
+  "SIM",
+  "C4",
+  "DTZ",
+  "PIE",
+  "RET",
+  "TCH",
+  "S"
+]
+ignore = [
+  "S101"
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_configs = true
+show_error_codes = true
+pretty = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["src"]
+exclude = ["^\.venv/"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q --strict-markers --disable-warnings"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/rffi_core"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 2
+fail_under = 85
